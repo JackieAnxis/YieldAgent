@@ -1,14 +1,110 @@
 # YieldAgent
 
-让 Shell 脚本能够暂停执行，向 AI Agent 发起提问，收到回答后继续运行。
+Mermaid 驱动的轻量级 Agent 工作流引擎
 
-## 特性
+## 为什么需要 YieldAgent
 
-- **暂停/恢复机制** — 脚本通过 `yield` 暂停，等待 Agent 回答后自动恢复
-- **双向通信** — 基于命名管道（FIFO）实现脚本与 Agent 的实时交互
-- **会话管理** — 支持多会话并行运行、查看、终止和清理
-- **JSON 输出** — 所有命令输出结构化 JSON，便于 Agent 自动化处理
-- **零依赖** — 纯 Bash 实现，可选 `jq` 优化 JSON 输出
+LLM 擅长单步执行——回答问题、生成内容、分析数据。但在多步任务中，模型会偏离流程、遗忘前置条件、自作主张跳过步骤。
+
+现有的编排工具（Dify 等）功能强大，但需要部署基础设施，有学习成本。
+
+YieldAgent 的思路很简单：**用流程图定义"做什么"，让模型只负责"怎么做"。** 编排逻辑从模型的脑袋移到确定性的脚本中——模型在每个节点上执行单步任务，流程图控制整体走向。
+
+## 看一个例子
+
+用 Mermaid 定义一个周末旅行规划的工作流：
+
+```mermaid
+flowchart TD
+    A[ask: 询问用户周末想去哪里玩？] --> B[ask: 搜索当地天气后告诉用户天气情况，询问用户是否要换个地方？让用户回答 yes或no]
+    B --> C{result: _last}
+    C -->|yes| A
+    C -->|no| F[ask: 询问用户想去几天？]
+    F --> H[ask: 搜索当地$_last天旅游攻略，整理成行程方案]
+    H --> J[cmd: echo $_last > travel-plan.md]
+    J --> K[cmd: echo 行程已保存到 travel-plan.md，祝你周末愉快！]
+```
+
+编译为可执行的 yield 脚本：
+
+```bash
+yield-mermaid compile weekend-trip.mmd
+```
+
+```bash
+#!/bin/bash
+# Generated from weekend-trip.mmd by yield-mermaid
+
+while true; do
+  _last=$(yield "询问用户周末想去哪里玩？")
+  A="$_last"
+  _last=$(yield "搜索当地天气后告诉用户天气情况，询问用户是否要换个地方？让用户回答 yes或no")
+  B="$_last"
+  case "$_last" in
+    yes) continue ;;
+    no) break ;;
+  esac
+done
+_last=$(yield "询问用户想去几天？")
+F="$_last"
+_last=$(yield "搜索当地$_last天旅游攻略，整理成行程方案")
+H="$_last"
+echo "$_last" > travel-plan.md
+echo 行程已保存到 travel-plan.md，祝你周末愉快！
+```
+
+运行后，Agent 依次收到提问并回答：
+
+```json
+{"type":"yield","message":"询问用户周末想去哪里玩？","session_id":"session_xxx"}
+```
+```bash
+# Agent 回答后，脚本继续
+yield-run resume session_xxx "杭州"
+```
+```json
+{"type":"yield","message":"搜索当地天气后告诉用户天气情况，询问用户是否要换个地方？让用户回答 yes或no","session_id":"session_xxx"}
+```
+```bash
+yield-run resume session_xxx "no"
+```
+```json
+{"type":"yield","message":"询问用户想去几天？","session_id":"session_xxx"}
+```
+
+流程图保证了执行顺序，Agent 不会跳步或遗忘。
+
+## 更多场景
+
+**代码审查流程：**
+
+```mermaid
+flowchart TD
+    A[cmd: npm run lint] --> B[cmd: npm test]
+    B --> C[ask: 检查结果摘要，是否有需要关注的问题？]
+    C --> D{result: _last}
+    D -->|pass| E[cmd: npm run deploy]
+    D -->|fail| F[cmd: echo 已取消部署]
+```
+
+**数据处理管道：**
+
+```mermaid
+flowchart TD
+    A[cmd: ./extract.sh raw_data.csv] --> B[ask: 数据已提取，检查是否有异常值？]
+    B --> C[cmd: ./clean.sh --fix]
+    C --> D[ask: 清洗完成，验证数据完整性？]
+    D --> E[cmd: ./load.sh production_db]
+```
+
+**多轮对话任务：**
+
+```mermaid
+flowchart TD
+    A[ask: 请描述你的项目需求] --> B[ask: 基于以上需求，列出技术选型方案供选择]
+    B --> C[ask: 确认最终方案，生成开发计划]
+    C --> D[cmd: echo $_last > development-plan.md]
+```
 
 ## 快速开始
 
@@ -17,104 +113,98 @@
 git clone git@github.com:JackieAnxis/YieldAgent.git
 cd YieldAgent
 
-# 运行示例脚本
+# 运行基础示例
 ./yield-run run './demo.sh'
-# 输出: {"type":"yield","message":"你好！你叫什么名字？","session_id":"session_xxx"}
 
-# 回复脚本的提问
-./yield-run resume session_xxx "我是 Claude"
-# 输出: {"type":"yield","message":"你喜欢做什么？","session_id":"session_xxx"}
-
-./yield-run resume session_xxx "帮助用户写代码"
-# 输出: {"type":"done","session_id":"session_xxx"}
+# 编译并运行 Mermaid 工作流
+cd mermaid-compiler && npm install
+node src/cli.js run examples/weekend-trip.mmd
 ```
 
-## 工作原理
+## 核心概念
 
-```
-┌──────────────────────────────────────────────────────┐
-│  Agent (Claude)                                       │
-│                                                      │
-│  1. yield-run run './script.sh'                      │
-│     → 脚本启动，执行到 yield 时暂停                    │
-│     → 收到 JSON: {type:"yield", message:"问题", ...}  │
-│                                                      │
-│  2. 理解 message，生成回答                             │
-│                                                      │
-│  3. yield-run resume <session_id> "回答"              │
-│     → 脚本收到回答，继续执行                           │
-│     → 可能再次 yield（回到步骤 2）或返回 done          │
-└──────────────────────────────────────────────────────┘
+### yield 语法
+
+在脚本中使用 `yield "问题"` 暂停执行，等待 Agent 回答：
+
+```bash
+name=$(yield "请给出一个适合存储用户日志的表名")
+echo "使用表名: $name"
 ```
 
-底层通过命名管道（FIFO）实现阻塞式 IPC：
+### 节点类型（Mermaid）
 
-- `yield_pipe` — 脚本写入问题，阻塞直到 Agent 读取
-- `resume_pipe` — Agent 写入回答，阻塞直到脚本读取
+| 前缀 | 用途 | 示例 |
+|------|------|------|
+| `cmd:` | 执行 shell 命令 | `[cmd: echo hello]` |
+| `ask:` | 向 Agent 提问 | `[ask: 选择哪个环境？]` |
+| `result:` | 条件分支 | `{result: _last}` |
 
-## 命令参考
+### 会话管理
+
+```bash
+yield-run list      # 列出活跃会话
+yield-run kill <id> # 终止会话
+yield-run clean     # 清理已结束的会话
+```
+
+## CLI 参考
+
+**yield-run：**
 
 ```
 yield-run run '<command>'              启动可 yield 的脚本
-yield-run resume <session_id> <text>   恢复暂停的会话，传入回答
-yield-run wait <session_id>            等待下次 yield 或完成（超时可配置）
-yield-run list                         列出所有活跃会话
-yield-run kill <session_id>            终止指定会话
+yield-run resume <session_id> <text>   恢复暂停的会话
+yield-run wait <session_id>            等待下次 yield 或完成
+yield-run list                         列出活跃会话
+yield-run kill <session_id>            终止会话
 yield-run clean                        清理已结束的会话
 ```
 
-### JSON 消息类型
+**yield-mermaid：**
 
-| 类型 | 说明 | 示例 |
-|------|------|------|
-| `yield` | 脚本暂停，请求 Agent 回答 | `{"type":"yield","message":"问题","session_id":"session_xxx"}` |
-| `done` | 脚本执行完毕 | `{"type":"done","session_id":"session_xxx"}` |
-| `error` | 发生错误 | `{"type":"error","message":"错误描述"}` |
-| `timeout` | 等待超时 | `{"type":"timeout","session_id":"session_xxx"}` |
-
-## 编写 Yield 脚本
-
-在脚本中直接使用 `yield "问题"`，它会暂停脚本并将问题发送给 Agent：
-
-```bash
-#!/bin/bash
-
-# 向 Agent 请求表名
-table_name=$(yield "请给出一个适合存储用户日志的数据库表名")
-echo "使用表名: $table_name"
-
-# 向 Agent 请求技术决策
-decision=$(yield "数据量约 100 万行，应该用分区表还是普通表？")
-echo "采用方案: $decision"
-
-# 让 Agent 检查构建结果
-review=$(yield "构建完成，以下是日志摘要，请检查是否有异常：$(tail -20 build.log)")
-echo "Agent 评估: $review"
+```
+yield-mermaid run <file.mmd>                      转译并执行
+yield-mermaid compile <file.mmd> [-o output.sh]   只转译不执行
+yield-mermaid validate <file.mmd>                  验证 Mermaid 语法
 ```
 
-`yield` 的返回值就是 Agent 的回答，可以直接赋值给变量使用。
+## 架构
 
-## 环境变量
+```
+Mermaid 流程图 (.mmd)
+    ↓
+yield-mermaid 编译
+    ├── parse: 解析 Mermaid 语法
+    ├── analyze: 图遍历、环检测
+    └── generate: AST → shell 脚本
+    ↓
+Shell 脚本 (.sh)
+    ↓
+yield-run 执行
+    ├── FIFO 管道通信
+    └── 会话生命周期管理
+    ↓
+Agent (Claude) 响应
+```
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `YIELD_TIMEOUT` | `30` | `wait` 命令超时秒数 |
-
-## Claude Code 集成
-
-项目内置了 Claude Code Skill（`.claude/skills/yield-agent/SKILL.md`），可让 Claude 自动处理 yield 脚本的暂停/恢复循环。
+底层通过命名管道（FIFO）实现阻塞式 IPC，脚本和 Agent 之间实时双向通信。
 
 ## 项目结构
 
 ```
 YieldAgent/
-├── yield-run              # CLI 入口，6 个子命令
-├── yield-wrapper.sh       # 核心引擎，管理 FIFO 管道和会话生命周期
-├── demo.sh                # 示例脚本
-└── .claude/
-    └── skills/
-        └── yield-agent/
-            └── SKILL.md   # Claude Code Skill 定义
+├── yield-run              # CLI 入口
+├── yield-wrapper.sh       # 核心引擎（FIFO + 会话管理）
+├── demo.sh                # 基础示例
+├── mermaid-compiler/      # Mermaid 编译器
+│   ├── src/
+│   │   ├── parser.js      # Mermaid 解析
+│   │   ├── analyzer.js    # 图分析
+│   │   ├── generator.js   # 代码生成
+│   │   └── cli.js         # CLI 入口
+│   └── examples/          # 示例流程图
+└── .claude/skills/        # Claude Code Skill
 ```
 
 ## License
