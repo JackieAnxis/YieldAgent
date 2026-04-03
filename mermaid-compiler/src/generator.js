@@ -71,8 +71,8 @@ function emitNode(node, lines, indent) {
 
   switch (prefix) {
     case 'cmd':
-      // 直接执行命令
-      lines.push(`${pad}${content}`);
+      // 直接执行命令，自动将裸 $var 包裹双引号
+      lines.push(`${pad}${quoteShellVars(content)}`);
       break;
 
     case 'ask':
@@ -142,6 +142,15 @@ function emitLoop(flow, lines, indent) {
   // 循环末尾的 break 条件需要在 body 内部的 case 中处理
   // 如果 body 中有 condition 且包含 break 指令
   lines.push(`${pad}done`);
+}
+
+/**
+ * 将命令中未引号包裹的 $var 自动包裹双引号
+ * 例如: echo $_last > file.txt → echo "$_last" > file.txt
+ */
+function quoteShellVars(cmd) {
+  // 匹配未被引号包裹的 $VAR 或 ${VAR}，替换为 "$var"
+  return cmd.replace(/(?<!["'])\$\{?([A-Za-z_]\w*)\}?/g, '"$$$1"');
 }
 
 /**

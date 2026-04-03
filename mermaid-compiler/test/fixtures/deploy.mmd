@@ -1,8 +1,8 @@
 flowchart TD
-    A[cmd: echo "部署开始"] --> B[ask: 选择哪个环境？]
+    A[cmd: echo 部署开始] --> B[ask: 选择哪个环境？]
     B --> C{result: _last}
-    C -->|staging| D[cmd: echo "部署到 staging"]
+    C -->|staging| D[cmd: echo 部署到 staging]
     C -->|production| E[ask: 确认部署到生产？]
     E --> F{result: _last}
-    F -->|yes| G[cmd: echo "部署到 production"]
-    F -->|no| H[cmd: echo "已取消"]
+    F -->|yes| G[cmd: echo 部署到 production]
+    F -->|no| H[cmd: echo 已取消]
