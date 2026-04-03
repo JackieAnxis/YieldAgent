@@ -1,0 +1,6 @@
+flowchart TD
+    subgraph 部署流程
+        A[cmd: echo "开始"] --> B[ask: 选环境？]
+    end
+    B --> C{result: _last}
+    C -->|staging| D[cmd: echo "staging"]

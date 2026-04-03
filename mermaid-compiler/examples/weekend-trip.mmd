@@ -1,0 +1,11 @@
+flowchart TD
+    A[ask: 询问用户周末想去哪里玩？] --> B[ask: 搜索当地天气后告诉用户天气情况，如果天气不太好，询问用户是否要换个地方？]
+    B --> C{result: _last}
+    C -->|ok| A
+    C -->|no| F[ask: 询问用户想去一天还是两天？回复"一天"或"两天"]
+    F --> G{result: _last}
+    G -->|一天| H[ask: 搜索当地一日游攻略，整理成行程方案]
+    G -->|两天| I[ask: 搜索当地两日游攻略，整理成行程方案]
+    H --> J[cmd: echo "$_last" > travel-plan.md]
+    I --> J
+    J --> K[cmd: echo "行程已保存到 travel-plan.md，祝你周末愉快！"]

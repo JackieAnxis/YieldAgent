@@ -1,0 +1,233 @@
+#!/bin/bash
+# yield-run - Yield Agent 通用 CLI
+#
+# 用法:
+#   yield-run run <command>                启动可 yield 脚本，输出 JSON
+#   yield-run resume <session_id> <response>  恢复暂停的会话
+#   yield-run wait <session_id>            等待会话下一次 yield 或完成
+#   yield-run list                         列出所有活跃会话
+#   yield-run kill <session_id>            终止会话
+#   yield-run clean                        清理已死会话
+
+set -euo pipefail
+
+# 定位 yield-wrapper.sh（同目录或 PATH 中）
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+WRAPPER="$SCRIPT_DIR/yield-wrapper.sh"
+if [ ! -f "$WRAPPER" ]; then
+  WRAPPER="$(command -v yield-wrapper.sh 2>/dev/null)" || {
+    echo '{"type":"error","message":"找不到 yield-wrapper.sh"}'
+    exit 1
+  }
+fi
+
+SESSION_DIR="/tmp/yield-sessions-$USER"
+[ -d "$SESSION_DIR" ] || SESSION_DIR="$HOME/.yield-sessions"
+
+cmd_run() {
+  if [ $# -eq 0 ]; then
+    echo '{"type":"error","message":"用法: yield-run run <command>"}'
+    exit 1
+  fi
+  "$WRAPPER" --json start "$*"
+}
+
+cmd_resume() {
+  if [ $# -lt 2 ]; then
+    echo '{"type":"error","message":"用法: yield-run resume <session_id> <response>"}'
+    exit 1
+  fi
+  local session_id="$1"; shift
+  "$WRAPPER" --json resume "$session_id" "$@"
+}
+
+cmd_wait() {
+  if [ $# -lt 1 ]; then
+    echo '{"type":"error","message":"用法: yield-run wait <session_id>"}'
+    exit 1
+  fi
+  local session_id="$1"
+  local session_path="$SESSION_DIR/$session_id"
+
+  if [ ! -d "$session_path" ]; then
+    echo "{\"type\":\"error\",\"session_id\":\"$session_id\",\"message\":\"会话不存在\"}"
+    exit 1
+  fi
+
+  local pid
+  pid=$(cat "$session_path/pid" 2>/dev/null) || {
+    echo "{\"type\":\"done\",\"session_id\":\"$session_id\"}"
+    rm -rf "$session_path"
+    exit 0
+  }
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "{\"type\":\"done\",\"session_id\":\"$session_id\"}"
+    rm -rf "$session_path"
+    exit 0
+  fi
+
+  # 等待下一次 yield 或进程结束
+  rm -f "$session_path/last_msg"
+  cat "$session_path/yield_pipe" > "$session_path/last_msg" 2>/dev/null &
+  local cat_pid=$!
+
+  # 轮询检查（默认超时 30 秒）
+  local timeout=${YIELD_TIMEOUT:-30}
+  local elapsed=0
+  while [ $elapsed -lt $((timeout * 10)) ]; do
+    sleep 0.1
+    elapsed=$((elapsed + 1))
+    if ! kill -0 "$pid" 2>/dev/null; then
+      kill "$cat_pid" 2>/dev/null
+      wait "$cat_pid" 2>/dev/null
+      echo "{\"type\":\"done\",\"session_id\":\"$session_id\"}"
+      rm -rf "$session_path"
+      exit 0
+    fi
+    if [ -s "$session_path/last_msg" ]; then
+      break
+    fi
+  done
+
+  if [ -s "$session_path/last_msg" ]; then
+    local msg
+    msg=$(cat "$session_path/last_msg")
+    # 使用 jq 安全输出 JSON
+    if command -v jq &>/dev/null; then
+      jq -n --arg msg "$msg" --arg sid "$session_id" \
+        '{type: "yield", message: $msg, session_id: $sid}'
+    else
+      local escaped
+      escaped=$(printf '%s' "$msg" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\n/\\n/g')
+      printf '{"type":"yield","message":"%s","session_id":"%s"}\n' "$escaped" "$session_id"
+    fi
+  else
+    # 超时
+    kill "$cat_pid" 2>/dev/null
+    wait "$cat_pid" 2>/dev/null
+    echo "{\"type\":\"timeout\",\"session_id\":\"$session_id\",\"message\":\"等待超时\"}"
+  fi
+}
+
+cmd_list() {
+  if [ ! -d "$SESSION_DIR" ]; then
+    echo '{"sessions":[]}'
+    exit 0
+  fi
+
+  local sessions="["
+  local first=true
+
+  for session_path in "$SESSION_DIR"/session_*; do
+    [ -d "$session_path" ] || continue
+    local sid
+    sid=$(basename "$session_path")
+    local pid cmd status msg
+
+    pid=$(cat "$session_path/pid" 2>/dev/null || echo "0")
+    cmd=$(cat "$session_path/session_id" 2>/dev/null || echo "$sid")
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+      status="done"
+    elif [ -s "$session_path/last_msg" ]; then
+      status="waiting"
+      msg=$(cat "$session_path/last_msg")
+    else
+      status="running"
+    fi
+
+    if [ "$first" = true ]; then
+      first=false
+    else
+      sessions="$sessions,"
+    fi
+
+    if [ -n "${msg:-}" ] && command -v jq &>/dev/null; then
+      sessions="$sessions$(jq -n --arg sid "$sid" --arg st "$status" --arg m "$msg" --arg p "$pid" \
+        '{session_id: $sid, status: $st, message: $m, pid: ($p|tonumber)}')"
+    else
+      local msg_escaped="${msg:-}"
+      msg_escaped=$(printf '%s' "$msg_escaped" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\n/\\n/g')
+      sessions="$sessions{\"session_id\":\"$sid\",\"status\":\"$status\",\"message\":\"$msg_escaped\",\"pid\":$pid}"
+    fi
+    unset msg
+  done
+
+  sessions="$sessions]"
+  if command -v jq &>/dev/null; then
+    echo "$sessions" | jq .
+  else
+    echo "$sessions"
+  fi
+}
+
+cmd_kill() {
+  if [ $# -lt 1 ]; then
+    echo '{"type":"error","message":"用法: yield-run kill <session_id>"}'
+    exit 1
+  fi
+  local session_id="$1"
+  local session_path="$SESSION_DIR/$session_id"
+
+  if [ ! -d "$session_path" ]; then
+    echo "{\"type\":\"error\",\"session_id\":\"$session_id\",\"message\":\"会话不存在\"}"
+    exit 1
+  fi
+
+  local pid
+  pid=$(cat "$session_path/pid" 2>/dev/null)
+  if [ -n "$pid" ]; then
+    kill "$pid" 2>/dev/null
+    # 也杀掉进程组
+    kill -- -"$pid" 2>/dev/null
+  fi
+  rm -rf "$session_path"
+  echo "{\"type\":\"done\",\"session_id\":\"$session_id\",\"message\":\"会话已终止\"}"
+}
+
+cmd_clean() {
+  if [ ! -d "$SESSION_DIR" ]; then
+    echo '{"type":"done","cleaned":0}'
+    exit 0
+  fi
+
+  local count=0
+  for session_path in "$SESSION_DIR"/session_*; do
+    [ -d "$session_path" ] || continue
+    local pid
+    pid=$(cat "$session_path/pid" 2>/dev/null)
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+      rm -rf "$session_path"
+      count=$((count + 1))
+    fi
+  done
+  echo "{\"type\":\"done\",\"cleaned\":$count}"
+}
+
+# 主入口
+case "${1:-}" in
+  run)    shift; cmd_run "$@" ;;
+  resume) shift; cmd_resume "$@" ;;
+  wait)   shift; cmd_wait "$@" ;;
+  list)   shift; cmd_list "$@" ;;
+  kill)   shift; cmd_kill "$@" ;;
+  clean)  shift; cmd_clean "$@" ;;
+  *)
+    cat <<'EOF'
+yield-run - Yield Agent CLI
+
+用法:
+  yield-run run <command>                 启动可 yield 脚本
+  yield-run resume <session_id> <response>   恢复暂停的会话
+  yield-run wait <session_id>             等待下一次 yield 或完成
+  yield-run list                          列出活跃会话
+  yield-run kill <session_id>             终止会话
+  yield-run clean                         清理已死会话
+
+环境变量:
+  YIELD_TIMEOUT  wait 命令超时秒数（默认 30）
+EOF
+    exit 1
+    ;;
+esac

@@ -1,0 +1,12 @@
+{
+  "name": "yield-mermaid",
+  "version": "0.1.0",
+  "description": "将 Mermaid 流程图转译为 yield shell 脚本",
+  "type": "module",
+  "bin": {
+    "yield-mermaid": "./src/cli.js"
+  },
+  "scripts": {
+    "test": "node test/run.js"
+  }
+}
